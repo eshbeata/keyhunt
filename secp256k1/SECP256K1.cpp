@@ -743,6 +743,99 @@ void Secp256K1::GetHash160(int type, bool compressed, Point &pubKey, unsigned ch
 
 
 
+#ifdef __AVX2__
+// ============================================================
+// 8-wide AVX2 GetHash160 — takes 8 full Points
+// ============================================================
+void Secp256K1::GetHash160_8(int type, bool compressed,
+  Point &k0, Point &k1, Point &k2, Point &k3,
+  Point &k4, Point &k5, Point &k6, Point &k7,
+  uint8_t *h0, uint8_t *h1, uint8_t *h2, uint8_t *h3,
+  uint8_t *h4, uint8_t *h5, uint8_t *h6, uint8_t *h7)
+{
+  unsigned char sh0[64] __attribute__((aligned(16)));
+  unsigned char sh1[64] __attribute__((aligned(16)));
+  unsigned char sh2[64] __attribute__((aligned(16)));
+  unsigned char sh3[64] __attribute__((aligned(16)));
+  unsigned char sh4[64] __attribute__((aligned(16)));
+  unsigned char sh5[64] __attribute__((aligned(16)));
+  unsigned char sh6[64] __attribute__((aligned(16)));
+  unsigned char sh7[64] __attribute__((aligned(16)));
+
+  switch (type) {
+  case P2PKH:
+  case BECH32:
+  {
+    if (!compressed) {
+      uint32_t b0[32], b1[32], b2[32], b3[32];
+      uint32_t b4[32], b5[32], b6[32], b7[32];
+      KEYBUFFUNCOMP(b0, k0); KEYBUFFUNCOMP(b1, k1);
+      KEYBUFFUNCOMP(b2, k2); KEYBUFFUNCOMP(b3, k3);
+      KEYBUFFUNCOMP(b4, k4); KEYBUFFUNCOMP(b5, k5);
+      KEYBUFFUNCOMP(b6, k6); KEYBUFFUNCOMP(b7, k7);
+      sha256avx2_2B(b0,b1,b2,b3,b4,b5,b6,b7, sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7);
+      ripemd160avx2_32(sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7, h0,h1,h2,h3,h4,h5,h6,h7);
+    } else {
+      uint32_t b0[16], b1[16], b2[16], b3[16];
+      uint32_t b4[16], b5[16], b6[16], b7[16];
+      KEYBUFFCOMP(b0, k0); KEYBUFFCOMP(b1, k1);
+      KEYBUFFCOMP(b2, k2); KEYBUFFCOMP(b3, k3);
+      KEYBUFFCOMP(b4, k4); KEYBUFFCOMP(b5, k5);
+      KEYBUFFCOMP(b6, k6); KEYBUFFCOMP(b7, k7);
+      sha256avx2_1B(b0,b1,b2,b3,b4,b5,b6,b7, sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7);
+      ripemd160avx2_32(sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7, h0,h1,h2,h3,h4,h5,h6,h7);
+    }
+  }
+  break;
+
+  case P2SH:
+  {
+    // Compute P2PKH hash first (compressed), then wrap in redeem script
+    uint8_t kh0[20],kh1[20],kh2[20],kh3[20],kh4[20],kh5[20],kh6[20],kh7[20];
+    GetHash160_8(P2PKH, true, k0,k1,k2,k3,k4,k5,k6,k7,
+                 kh0,kh1,kh2,kh3,kh4,kh5,kh6,kh7);
+    uint32_t b0[16], b1[16], b2[16], b3[16];
+    uint32_t b4[16], b5[16], b6[16], b7[16];
+    KEYBUFFSCRIPT(b0, kh0); KEYBUFFSCRIPT(b1, kh1);
+    KEYBUFFSCRIPT(b2, kh2); KEYBUFFSCRIPT(b3, kh3);
+    KEYBUFFSCRIPT(b4, kh4); KEYBUFFSCRIPT(b5, kh5);
+    KEYBUFFSCRIPT(b6, kh6); KEYBUFFSCRIPT(b7, kh7);
+    sha256avx2_1B(b0,b1,b2,b3,b4,b5,b6,b7, sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7);
+    ripemd160avx2_32(sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7, h0,h1,h2,h3,h4,h5,h6,h7);
+  }
+  break;
+  }
+}
+
+// 8-wide AVX2 GetHash160_fromX — takes 8 X-coordinate Ints + prefix byte
+void Secp256K1::GetHash160_fromX_8(int type, unsigned char prefix,
+  Int *k0, Int *k1, Int *k2, Int *k3,
+  Int *k4, Int *k5, Int *k6, Int *k7,
+  uint8_t *h0, uint8_t *h1, uint8_t *h2, uint8_t *h3,
+  uint8_t *h4, uint8_t *h5, uint8_t *h6, uint8_t *h7)
+{
+  unsigned char sh0[64] __attribute__((aligned(16)));
+  unsigned char sh1[64] __attribute__((aligned(16)));
+  unsigned char sh2[64] __attribute__((aligned(16)));
+  unsigned char sh3[64] __attribute__((aligned(16)));
+  unsigned char sh4[64] __attribute__((aligned(16)));
+  unsigned char sh5[64] __attribute__((aligned(16)));
+  unsigned char sh6[64] __attribute__((aligned(16)));
+  unsigned char sh7[64] __attribute__((aligned(16)));
+
+  if (type == P2PKH) {
+    uint32_t b0[16], b1[16], b2[16], b3[16];
+    uint32_t b4[16], b5[16], b6[16], b7[16];
+    KEYBUFFPREFIX(b0, k0, prefix); KEYBUFFPREFIX(b1, k1, prefix);
+    KEYBUFFPREFIX(b2, k2, prefix); KEYBUFFPREFIX(b3, k3, prefix);
+    KEYBUFFPREFIX(b4, k4, prefix); KEYBUFFPREFIX(b5, k5, prefix);
+    KEYBUFFPREFIX(b6, k6, prefix); KEYBUFFPREFIX(b7, k7, prefix);
+    sha256avx2_1B(b0,b1,b2,b3,b4,b5,b6,b7, sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7);
+    ripemd160avx2_32(sh0,sh1,sh2,sh3,sh4,sh5,sh6,sh7, h0,h1,h2,h3,h4,h5,h6,h7);
+  }
+}
+#endif // __AVX2__
+
 void Secp256K1::GetHash160_fromX(int type,unsigned char prefix,
   Int *k0,Int *k1,Int *k2,Int *k3,
   uint8_t *h0,uint8_t *h1,uint8_t *h2,uint8_t *h3) {

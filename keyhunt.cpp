@@ -124,7 +124,7 @@ int minikey_n_limit;
 	
 const char *version = "0.2.230519 Satoshi Quest";
 
-#define CPU_GRP_SIZE 1024
+#define CPU_GRP_SIZE 2048  // Increased from 1024: better amortizes ModInv fixed cost
 
 std::vector<Point> Gn;
 Point _2Gn;
@@ -264,7 +264,11 @@ struct bloom *vanity_bloom = NULL;
 
 struct bloom bloom;
 
-uint64_t *steps = NULL;
+/* Each steps counter is padded to its own 64-byte cache line to prevent
+ * false sharing between threads that increment steps[thread_number] in tight loops.
+ * STEPS_STRIDE is the number of uint64_t elements per cache-line slot (8 × 8 = 64 bytes). */
+#define STEPS_STRIDE 8
+uint64_t *steps = NULL;   /* allocated as NTHREADS * STEPS_STRIDE uint64_t values */
 unsigned int *ends = NULL;
 uint64_t N = 0;
 
@@ -307,6 +311,14 @@ int FLAGRAWDATA	= 0;
 int FLAGRANDOM = 0;
 int FLAG_N = 0;
 int FLAGPRECALCUTED_P_FILE = 0;
+
+/* Distributed architecture flags */
+int FLAGPARTITION = 0;
+int FLAGCHECKPOINT = 0;
+int FLAGRESUME = 0;
+int NODE_ID = 0;
+char *partition_file = NULL;
+char *checkpoint_file = NULL;
 
 int bitrange;
 char *str_N;
@@ -412,6 +424,109 @@ Int lambda,lambda2,beta,beta2;
 
 Secp256K1 *secp;
 
+/*
+ * load_partition: read node N's range from a partition file.
+ * File format (one line per node, whitespace-delimited):
+ *   <node_id> <start_hex> <end_hex>
+ * Example:
+ *   0 0000000000000001 00000000FFFFFFFF
+ *   1 0000000100000000 00000001FFFFFFFF
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+static int load_partition(const char *fname, int node_id, Int *rstart, Int *rend)
+{
+	FILE *fp = fopen(fname, "r");
+	if (!fp) {
+		fprintf(stderr, "[E] Cannot open partition file: %s\n", fname);
+		return 0;
+	}
+	char line[256];
+	int found = 0;
+	while (fgets(line, sizeof(line), fp)) {
+		/* skip blank lines and comments */
+		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+			continue;
+		int id;
+		char s_hex[128], e_hex[128];
+		if (sscanf(line, "%d %127s %127s", &id, s_hex, e_hex) == 3) {
+			if (id == node_id) {
+				rstart->SetBase16(s_hex);
+				rend->SetBase16(e_hex);
+				found = 1;
+				break;
+			}
+		}
+	}
+	fclose(fp);
+	if (!found) {
+		fprintf(stderr, "[E] Node %d not found in partition file: %s\n", node_id, fname);
+		return 0;
+	}
+	return 1;
+}
+
+/*
+ * write_checkpoint: atomically write current search position to a file.
+ * Format:
+ *   POS=<current_hex>\n
+ *   COUNT=<keys_checked>\n
+ *   TIME=<unix_timestamp>\n
+ *
+ * Writes to <fname>.tmp then renames to <fname> (atomic on POSIX).
+ */
+static void write_checkpoint(const char *fname, Int *current_pos, uint64_t count)
+{
+	/* Build temp filename */
+	char tmpname[512];
+	snprintf(tmpname, sizeof(tmpname), "%s.tmp", fname);
+
+	FILE *fp = fopen(tmpname, "w");
+	if (!fp) {
+		fprintf(stderr, "[W] Cannot write checkpoint: %s\n", tmpname);
+		return;
+	}
+	char *hex = current_pos->GetBase16();
+	fprintf(fp, "POS=%s\n", hex ? hex : "0");
+	fprintf(fp, "COUNT=%" PRIu64 "\n", count);
+	fprintf(fp, "TIME=%ld\n", (long)time(NULL));
+	free(hex);
+	fclose(fp);
+
+	if (rename(tmpname, fname) != 0) {
+		fprintf(stderr, "[W] Cannot rename checkpoint temp file\n");
+	}
+}
+
+/*
+ * load_checkpoint: read POS= from a checkpoint file and set rstart.
+ * Returns 1 on success, 0 on failure.
+ */
+static int load_checkpoint(const char *fname, Int *rstart)
+{
+	FILE *fp = fopen(fname, "r");
+	if (!fp) {
+		fprintf(stderr, "[W] Cannot open checkpoint file (will start from range begin): %s\n", fname);
+		return 0;
+	}
+	char line[256];
+	int found = 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (strncmp(line, "POS=", 4) == 0) {
+			char *hex = line + 4;
+			/* strip trailing newline */
+			hex[strcspn(hex, "\r\n")] = '\0';
+			if (hex[0] != '\0') {
+				rstart->SetBase16(hex);
+				found = 1;
+			}
+			break;
+		}
+	}
+	fclose(fp);
+	return found;
+}
+
 int main(int argc, char **argv)	{
 	char buffer[2048];
 	char rawvalue[32];
@@ -486,7 +601,7 @@ int main(int argc, char **argv)	{
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
+	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:P:X:K:")) != -1) {
 		switch(c) {
 			case 'h':
 				menu();
@@ -770,6 +885,24 @@ int main(int argc, char **argv)	{
 				}
 				printf("[+] Bloom Size Multiplier %i\n",FLAGBLOOMMULTIPLIER);
 			break;
+			case 'P':
+				/* -P <partition_file>  Load keyspace range for this node from a partition file */
+				partition_file = optarg;
+				FLAGPARTITION = 1;
+				printf("[+] Partition file: %s\n", partition_file);
+			break;
+			case 'X':
+				/* -X <node_id>  Node index for partition file lookup (default 0) */
+				NODE_ID = (int)strtol(optarg, NULL, 10);
+				printf("[+] Node ID: %d\n", NODE_ID);
+			break;
+			case 'K':
+				/* -K <checkpoint_file>  Write (and optionally resume from) a checkpoint file */
+				checkpoint_file = optarg;
+				FLAGCHECKPOINT = 1;
+				FLAGRESUME = 1;  /* always try to resume if checkpoint file exists */
+				printf("[+] Checkpoint file: %s\n", checkpoint_file);
+			break;
 			default:
 				fprintf(stderr,"[E] Unknow opcion -%c\n",c);
 				exit(EXIT_FAILURE);
@@ -862,8 +995,50 @@ int main(int argc, char **argv)	{
 			}
 		}
 	}
+
+	/* --- Distributed architecture: partition file overrides range --- */
+	if(FLAGPARTITION)	{
+		if(load_partition(partition_file, NODE_ID, &n_range_start, &n_range_end))	{
+			if(n_range_start.IsZero())	{
+				n_range_start.AddOne();
+			}
+			n_range_diff.Set(&n_range_end);
+			n_range_diff.Sub(&n_range_start);
+			FLAGRANGE = 1;
+			char *ps = n_range_start.GetBase16();
+			char *pe = n_range_end.GetBase16();
+			printf("[+] Partition node %d: range [%s, %s]\n", NODE_ID, ps, pe);
+			free(ps);
+			free(pe);
+		}
+		else	{
+			fprintf(stderr,"[E] Failed to load partition. Exiting.\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	/* --- Distributed architecture: resume from checkpoint --- */
+	if(FLAGRESUME && checkpoint_file)	{
+		Int resume_pos;
+		if(load_checkpoint(checkpoint_file, &resume_pos))	{
+			/* Only apply if resume_pos is within current range */
+			if(resume_pos.IsGreater(&n_range_start) && resume_pos.IsLower(&n_range_end))	{
+				char *rp = resume_pos.GetBase16();
+				printf("[+] Resuming from checkpoint: %s\n", rp);
+				free(rp);
+				n_range_start.Set(&resume_pos);
+				n_range_diff.Set(&n_range_end);
+				n_range_diff.Sub(&n_range_start);
+			}
+			else	{
+				printf("[+] Checkpoint position outside current range, starting from range begin\n");
+			}
+		}
+	}
+	/* --- End distributed architecture setup --- */
+
 	N = 0;
-	
+
 	if(FLAGMODE != MODE_BSGS )	{
 		if(FLAG_N){
 			if(str_N[0] == '0' && str_N[1] == 'x')	{
@@ -2027,7 +2202,7 @@ int main(int argc, char **argv)	{
 
 		i = 0;
 
-		steps = (uint64_t *) calloc(NTHREADS,sizeof(uint64_t));
+		steps = (uint64_t *) calloc(NTHREADS * STEPS_STRIDE,sizeof(uint64_t));
 		checkpointer((void *)steps,__FILE__,"calloc","steps" ,__LINE__ -1 );
 		ends = (unsigned int *) calloc(NTHREADS,sizeof(int));
 		checkpointer((void *)ends,__FILE__,"calloc","ends" ,__LINE__ -1 );
@@ -2042,7 +2217,7 @@ int main(int argc, char **argv)	{
 			tt = (tothread*) malloc(sizeof(struct tothread));
 			checkpointer((void *)tt,__FILE__,"malloc","tt" ,__LINE__ -1 );
 			tt->nt = j;
-			steps[j] = 0;
+			steps[j * STEPS_STRIDE] = 0;
 			s = 0;
 			switch(FLAGBSGSMODE)	{
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -2092,7 +2267,7 @@ int main(int argc, char **argv)	{
 		free(aux);
 	}
 	if(FLAGMODE != MODE_BSGS)	{
-		steps = (uint64_t *) calloc(NTHREADS,sizeof(uint64_t));
+		steps = (uint64_t *) calloc(NTHREADS * STEPS_STRIDE,sizeof(uint64_t));
 		checkpointer((void *)steps,__FILE__,"calloc","steps" ,__LINE__ -1 );
 		ends = (unsigned int *) calloc(NTHREADS,sizeof(int));
 		checkpointer((void *)ends,__FILE__,"calloc","ends" ,__LINE__ -1 );
@@ -2106,7 +2281,7 @@ int main(int argc, char **argv)	{
 			tt = (tothread*) malloc(sizeof(struct tothread));
 			checkpointer((void *)tt,__FILE__,"malloc","tt" ,__LINE__ -1 );
 			tt->nt = j;
-			steps[j] = 0;
+			steps[j * STEPS_STRIDE] = 0;
 			s = 0;
 			switch(FLAGMODE)	{
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -2168,7 +2343,7 @@ int main(int argc, char **argv)	{
 				total.SetInt32(0);
 				for(j = 0; j < NTHREADS; j++) {
 					pretotal.Set(&debugcount_mpz);
-					pretotal.Mult(steps[j]);					
+					pretotal.Mult(steps[j * STEPS_STRIDE]);
 					total.Add(&pretotal);
 				}
 				
@@ -2247,6 +2422,29 @@ int main(int argc, char **argv)	{
 				free(str_seconds);
 				free(str_pretotal);
 				free(str_total);
+
+				/* Periodic checkpoint write.
+				 * Take a consistent snapshot of n_range_start under write_random
+				 * to avoid a torn read while a thread is mid-Add(). */
+				if(FLAGCHECKPOINT && checkpoint_file && !FLAGRANDOM)	{
+					uint64_t chk_count = 0;
+					int jj;
+					for(jj = 0; jj < NTHREADS; jj++) {
+						chk_count += steps[jj * STEPS_STRIDE];
+					}
+					chk_count *= (uint64_t)CPU_GRP_SIZE;
+					Int chk_pos;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					WaitForSingleObject(write_random, INFINITE);
+					chk_pos.Set(&n_range_start);
+					ReleaseMutex(write_random);
+#else
+					pthread_mutex_lock(&write_random);
+					chk_pos.Set(&n_range_start);
+					pthread_mutex_unlock(&write_random);
+#endif
+					write_checkpoint(checkpoint_file, &chk_pos, chk_count);
+				}
 			}
 		}
 	}while(continue_flag);
@@ -2496,7 +2694,7 @@ void *thread_process_minikeys(void *vargp)	{
 						}
 					}
 				}
-				steps[thread_number]++;
+				steps[thread_number * STEPS_STRIDE]++;
 				count+=1024;
 			}while(count < N_SEQUENTIAL_MAX && continue_flag);
 		}
@@ -2511,12 +2709,13 @@ DWORD WINAPI thread_process(LPVOID vargp) {
 void *thread_process(void *vargp)	{
 #endif
 	struct tothread *tt;
-	Point pts[CPU_GRP_SIZE];
-	Point endomorphism_beta[CPU_GRP_SIZE];
-	Point endomorphism_beta2[CPU_GRP_SIZE];
+	// 64-byte aligned so each Point starts on a cache-line boundary
+	Point pts[CPU_GRP_SIZE]                    __attribute__((aligned(64)));
+	Point endomorphism_beta[CPU_GRP_SIZE]      __attribute__((aligned(64)));
+	Point endomorphism_beta2[CPU_GRP_SIZE]     __attribute__((aligned(64)));
 	Point endomorphism_negeted_point[4];
-	
-	Int dx[CPU_GRP_SIZE / 2 + 1];
+
+	Int dx[CPU_GRP_SIZE / 2 + 1]              __attribute__((aligned(64)));
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
 	Int dy;
@@ -2710,12 +2909,98 @@ void *thread_process(void *vargp)	{
 					endomorphism_beta2[0].x.ModMulK1(&pn.x, &beta2);
 				}
 								
+				// AVX2 fast path: BTC address/rmd160, no endomorphism — 8 keys per hash call.
+				// SEARCH_COMPRESS/BOTH: GetHash160_fromX_8 (X only, no Y required).
+				// SEARCH_UNCOMPRESS/BOTH: GetHash160_8 (needs Y; calculate_y is true for these modes).
+#ifdef __AVX2__
+				if( (FLAGMODE == MODE_ADDRESS || FLAGMODE == MODE_RMD160) &&
+				    FLAGCRYPTO == CRYPTO_BTC &&
+				    !FLAGENDOMORPHISM)
+				{
+					char avx2_hashes[2][8][20]; // [parity02/03][key_idx][hash_bytes]
+					char avx2_uncomp[8][20];    // uncompressed hashes for SEARCH_BOTH/UNCOMPRESS
+					for(j = 0; j < CPU_GRP_SIZE/8; j++){
+						int base = (int)(j * 8);
+
+						if(FLAGSEARCH == SEARCH_COMPRESS || FLAGSEARCH == SEARCH_BOTH){
+							// Compressed: derive from X coordinate only (no Y needed)
+							secp->GetHash160_fromX_8(P2PKH, 0x02,
+								&pts[base].x,   &pts[base+1].x, &pts[base+2].x, &pts[base+3].x,
+								&pts[base+4].x, &pts[base+5].x, &pts[base+6].x, &pts[base+7].x,
+								(uint8_t*)avx2_hashes[0][0],(uint8_t*)avx2_hashes[0][1],
+								(uint8_t*)avx2_hashes[0][2],(uint8_t*)avx2_hashes[0][3],
+								(uint8_t*)avx2_hashes[0][4],(uint8_t*)avx2_hashes[0][5],
+								(uint8_t*)avx2_hashes[0][6],(uint8_t*)avx2_hashes[0][7]);
+							secp->GetHash160_fromX_8(P2PKH, 0x03,
+								&pts[base].x,   &pts[base+1].x, &pts[base+2].x, &pts[base+3].x,
+								&pts[base+4].x, &pts[base+5].x, &pts[base+6].x, &pts[base+7].x,
+								(uint8_t*)avx2_hashes[1][0],(uint8_t*)avx2_hashes[1][1],
+								(uint8_t*)avx2_hashes[1][2],(uint8_t*)avx2_hashes[1][3],
+								(uint8_t*)avx2_hashes[1][4],(uint8_t*)avx2_hashes[1][5],
+								(uint8_t*)avx2_hashes[1][6],(uint8_t*)avx2_hashes[1][7]);
+							// Check all 16 compressed results (8 keys × 2 parities)
+							for(k = 0; k < 8; k++){
+								for(l = 0; l < 2; l++){
+									uint8_t *hp = (uint8_t*)avx2_hashes[l][k];
+									r = bloom_check(&bloom, hp, MAXLENGTHADDRESS);
+									if(r){
+										r = searchbinary(addressTable, hp, N);
+										if(r){
+											keyfound.SetInt32(base + k);
+											keyfound.Mult(&stride);
+											keyfound.Add(&key_mpz);
+											Point pubk = secp->ComputePublicKey(&keyfound);
+											secp->GetHash160(P2PKH, true, pubk, (uint8_t*)publickeyhashrmd160);
+											if(memcmp(hp, publickeyhashrmd160, 20) != 0){
+												keyfound.Neg();
+												keyfound.Add(&secp->order);
+											}
+											writekey(true, &keyfound);
+										}
+									}
+								}
+							}
+						}
+
+						if(FLAGSEARCH == SEARCH_UNCOMPRESS || FLAGSEARCH == SEARCH_BOTH){
+							// Uncompressed: needs full Point (Y computed since calculate_y==true)
+							secp->GetHash160_8(P2PKH, false,
+								pts[base],   pts[base+1], pts[base+2], pts[base+3],
+								pts[base+4], pts[base+5], pts[base+6], pts[base+7],
+								(uint8_t*)avx2_uncomp[0],(uint8_t*)avx2_uncomp[1],
+								(uint8_t*)avx2_uncomp[2],(uint8_t*)avx2_uncomp[3],
+								(uint8_t*)avx2_uncomp[4],(uint8_t*)avx2_uncomp[5],
+								(uint8_t*)avx2_uncomp[6],(uint8_t*)avx2_uncomp[7]);
+							for(k = 0; k < 8; k++){
+								uint8_t *hp = (uint8_t*)avx2_uncomp[k];
+								r = bloom_check(&bloom, hp, MAXLENGTHADDRESS);
+								if(r){
+									r = searchbinary(addressTable, hp, N);
+									if(r){
+										keyfound.SetInt32(base + k);
+										keyfound.Mult(&stride);
+										keyfound.Add(&key_mpz);
+										writekey(false, &keyfound);
+									}
+								}
+							}
+						}
+
+						count  += 8;
+						temp_stride.SetInt32(8);
+						temp_stride.Mult(&stride);
+						key_mpz.Add(&temp_stride);
+					}
+					goto avx2_done;
+				}
+#endif // __AVX2__
+
 				for(j = 0; j < CPU_GRP_SIZE/4;j++){
 					switch(FLAGMODE)	{
 						case MODE_RMD160:
 						case MODE_ADDRESS:
 							if(FLAGCRYPTO == CRYPTO_BTC){
-								
+
 								if(FLAGSEARCH == SEARCH_COMPRESS || FLAGSEARCH == SEARCH_BOTH ){
 									if(FLAGENDOMORPHISM)	{
 										secp->GetHash160_fromX(P2PKH,0x02,&pts[(j*4)].x,&pts[(j*4)+1].x,&pts[(j*4)+2].x,&pts[(j*4)+3].x,(uint8_t*)publickeyhashrmd160_endomorphism[0][0],(uint8_t*)publickeyhashrmd160_endomorphism[0][1],(uint8_t*)publickeyhashrmd160_endomorphism[0][2],(uint8_t*)publickeyhashrmd160_endomorphism[0][3]);
@@ -3066,6 +3351,9 @@ void *thread_process(void *vargp)	{
 					temp_stride.Mult(&stride);
 					key_mpz.Add(&temp_stride);
 				}
+#ifdef __AVX2__
+avx2_done:;
+#endif
 				/*
 				if(FLAGDEBUG) {
 					printf("\n[D] thread_process %i\n",__LINE__ -1 );
@@ -3073,7 +3361,7 @@ void *thread_process(void *vargp)	{
 				}
 				*/
 
-				steps[thread_number]++;
+				steps[thread_number * STEPS_STRIDE]++;
 
 				// Next start point (startP + GRP_SIZE*G)
 				pp = startP;
@@ -3510,7 +3798,7 @@ void *thread_process_vanity(void *vargp)	{
 					temp_stride.Mult(&stride);
 					key_mpz.Add(&temp_stride);
 				}
-				steps[thread_number]++;
+				steps[thread_number * STEPS_STRIDE]++;
 
 				// Next start point (startP + GRP_SIZE*G)
 				pp = startP;
@@ -3807,8 +4095,8 @@ void *thread_process_bsgs(void *vargp)	{
 	thread_number = tt->nt;
 	free(tt);
 	
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 
@@ -3945,7 +4233,7 @@ pn.y.ModAdd(&GSn[i].y);
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 						if(r) {
-							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+							r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),k,&keyfound);
 							if(r)	{
 								hextemp = keyfound.GetBase16();
 								printf("[+] Thread Key found privkey %s   \n",hextemp);
@@ -4002,7 +4290,7 @@ pn.y.ModAdd(&GSn[i].y);
 				} // end while
 			}// End if 
 		}
-		steps[thread_number]+=2;
+		steps[thread_number * STEPS_STRIDE]+=2;
 	}while(1);
 	ends[thread_number] = 1;
 	return NULL;
@@ -4043,8 +4331,8 @@ void *thread_process_bsgs_random(void *vargp)	{
 	thread_number = tt->nt;
 	free(tt);
 	
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 	
@@ -4194,7 +4482,7 @@ pn.y.ModAdd(&GSn[i].y);
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 						if(r) {
-							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+							r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),k,&keyfound);
 							if(r)	{
 								hextemp = keyfound.GetBase16();
 								printf("[+] Thread Key found privkey %s    \n",hextemp);
@@ -4257,7 +4545,7 @@ pn.y.ModAdd(&GSn[i].y);
 			}	//End if
 		} // End for with k bsgs_point_number
 
-		steps[thread_number]+=2;
+		steps[thread_number * STEPS_STRIDE]+=2;
 	}while(1);
 	ends[thread_number] = 1;
 	return NULL;
@@ -4811,8 +5099,8 @@ void *thread_process_bsgs_dance(void *vargp)	{
 	thread_number = tt->nt;
 	free(tt);
 	
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 	
@@ -4999,7 +5287,7 @@ pn.y.ModAdd(&GSn[i].y);
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 						if(r) {
-							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+							r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),k,&keyfound);
 							if(r)	{
 								hextemp = keyfound.GetBase16();
 								printf("[+] Thread Key found privkey %s   \n",hextemp);
@@ -5060,7 +5348,7 @@ pn.y.ModAdd(&GSn[i].y);
 				}//while all the aMP points
 			}// End if 
 		}
-		steps[thread_number]+=2;
+		steps[thread_number * STEPS_STRIDE]+=2;
 	}while(1);
 	ends[thread_number] = 1;
 	return NULL;
@@ -5099,8 +5387,8 @@ void *thread_process_bsgs_backward(void *vargp)	{
 	thread_number = tt->nt;
 	free(tt);
 
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 	
@@ -5257,7 +5545,7 @@ pn.y.ModAdd(&GSn[i].y);
 						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 						if(r) {
-							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+							r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),k,&keyfound);
 							if(r)	{
 								hextemp = keyfound.GetBase16();
 								printf("[+] Thread Key found privkey %s   \n",hextemp);
@@ -5317,7 +5605,7 @@ pn.y.ModAdd(&GSn[i].y);
 				}//while all the aMP points
 			}// End if 
 		}
-		steps[thread_number]+=2;
+		steps[thread_number * STEPS_STRIDE]+=2;
 	}while(1);
 	ends[thread_number] = 1;
 	return NULL;
@@ -5357,8 +5645,8 @@ void *thread_process_bsgs_both(void *vargp)	{
 	thread_number = tt->nt;
 	free(tt);
 	
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 	intaux.Set(&BSGS_M_double);
@@ -5541,7 +5829,7 @@ void *thread_process_bsgs_both(void *vargp)	{
 							pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
 							r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 							if(r) {
-								r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+								r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),k,&keyfound);
 								if(r)	{
 									hextemp = keyfound.GetBase16();
 									printf("[+] Thread Key found privkey %s   \n",hextemp);
@@ -5602,7 +5890,7 @@ void *thread_process_bsgs_both(void *vargp)	{
 					}//while all the aMP points
 			}// End if 
 		}
-		steps[thread_number]+=2;	
+		steps[thread_number * STEPS_STRIDE]+=2;	
 	}while(1);
 	ends[thread_number] = 1;
 	return NULL;

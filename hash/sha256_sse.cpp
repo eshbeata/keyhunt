@@ -576,6 +576,468 @@ void sha256sse_checksum(uint32_t *i0, uint32_t *i1, uint32_t *i2, uint32_t *i3,
 
 }
 
+// ============================================================
+// AVX2 8-wide SHA256 implementation
+// Processes 8 SHA256 hashes in parallel using 256-bit vectors.
+// Requires: -mavx2 (auto-detected via __AVX2__ macro).
+// ============================================================
+#ifdef __AVX2__
+
+namespace _sha256avx2
+{
+
+static const uint32_t _init[] __attribute__((aligned(32))) = {
+    // 8 copies of each IV word (one per 256-bit lane)
+    0x6a09e667,0x6a09e667,0x6a09e667,0x6a09e667,
+    0x6a09e667,0x6a09e667,0x6a09e667,0x6a09e667,
+    0xbb67ae85,0xbb67ae85,0xbb67ae85,0xbb67ae85,
+    0xbb67ae85,0xbb67ae85,0xbb67ae85,0xbb67ae85,
+    0x3c6ef372,0x3c6ef372,0x3c6ef372,0x3c6ef372,
+    0x3c6ef372,0x3c6ef372,0x3c6ef372,0x3c6ef372,
+    0xa54ff53a,0xa54ff53a,0xa54ff53a,0xa54ff53a,
+    0xa54ff53a,0xa54ff53a,0xa54ff53a,0xa54ff53a,
+    0x510e527f,0x510e527f,0x510e527f,0x510e527f,
+    0x510e527f,0x510e527f,0x510e527f,0x510e527f,
+    0x9b05688c,0x9b05688c,0x9b05688c,0x9b05688c,
+    0x9b05688c,0x9b05688c,0x9b05688c,0x9b05688c,
+    0x1f83d9ab,0x1f83d9ab,0x1f83d9ab,0x1f83d9ab,
+    0x1f83d9ab,0x1f83d9ab,0x1f83d9ab,0x1f83d9ab,
+    0x5be0cd19,0x5be0cd19,0x5be0cd19,0x5be0cd19,
+    0x5be0cd19,0x5be0cd19,0x5be0cd19,0x5be0cd19
+};
+
+#define A_Maj(b,c,d) _mm256_or_si256(_mm256_and_si256(b, c), _mm256_and_si256(d, _mm256_or_si256(b, c)))
+#define A_Ch(b,c,d)  _mm256_xor_si256(_mm256_and_si256(b, c), _mm256_andnot_si256(b, d))
+#define A_ROR(x,n)   _mm256_or_si256(_mm256_srli_epi32(x, n), _mm256_slli_epi32(x, 32-(n)))
+#define A_SHR(x,n)   _mm256_srli_epi32(x, n)
+
+#define A_S0(x) (_mm256_xor_si256(A_ROR((x), 2),  _mm256_xor_si256(A_ROR((x), 13), A_ROR((x), 22))))
+#define A_S1(x) (_mm256_xor_si256(A_ROR((x), 6),  _mm256_xor_si256(A_ROR((x), 11), A_ROR((x), 25))))
+#define A_s0(x) (_mm256_xor_si256(A_ROR((x), 7),  _mm256_xor_si256(A_ROR((x), 18), A_SHR((x), 3))))
+#define A_s1(x) (_mm256_xor_si256(A_ROR((x), 17), _mm256_xor_si256(A_ROR((x), 19), A_SHR((x), 10))))
+
+#define A_add4(x0,x1,x2,x3) _mm256_add_epi32(_mm256_add_epi32(x0,x1),_mm256_add_epi32(x2,x3))
+#define A_add3(x0,x1,x2)    _mm256_add_epi32(_mm256_add_epi32(x0,x1),x2)
+#define A_add5(x0,x1,x2,x3,x4) _mm256_add_epi32(A_add3(x0,x1,x2),_mm256_add_epi32(x3,x4))
+
+#define A_Round(a,b,c,d,e,f,g,h,i,w)                               \
+    T1 = A_add5(h, A_S1(e), A_Ch(e,f,g), _mm256_set1_epi32(i), w); \
+    d  = _mm256_add_epi32(d, T1);                                   \
+    T2 = _mm256_add_epi32(A_S0(a), A_Maj(a,b,c));                  \
+    h  = _mm256_add_epi32(T1, T2);
+
+#define A_WMIX() \
+  w0  = A_add4(A_s1(w14), w9,  A_s0(w1),  w0);  \
+  w1  = A_add4(A_s1(w15), w10, A_s0(w2),  w1);  \
+  w2  = A_add4(A_s1(w0),  w11, A_s0(w3),  w2);  \
+  w3  = A_add4(A_s1(w1),  w12, A_s0(w4),  w3);  \
+  w4  = A_add4(A_s1(w2),  w13, A_s0(w5),  w4);  \
+  w5  = A_add4(A_s1(w3),  w14, A_s0(w6),  w5);  \
+  w6  = A_add4(A_s1(w4),  w15, A_s0(w7),  w6);  \
+  w7  = A_add4(A_s1(w5),  w0,  A_s0(w8),  w7);  \
+  w8  = A_add4(A_s1(w6),  w1,  A_s0(w9),  w8);  \
+  w9  = A_add4(A_s1(w7),  w2,  A_s0(w10), w9);  \
+  w10 = A_add4(A_s1(w8),  w3,  A_s0(w11), w10); \
+  w11 = A_add4(A_s1(w9),  w4,  A_s0(w12), w11); \
+  w12 = A_add4(A_s1(w10), w5,  A_s0(w13), w12); \
+  w13 = A_add4(A_s1(w11), w6,  A_s0(w14), w13); \
+  w14 = A_add4(A_s1(w12), w7,  A_s0(w15), w14); \
+  w15 = A_add4(A_s1(w13), w8,  A_s0(w0),  w15);
+
+  void Initialize(__m256i *s) {
+    memcpy(s, _init, sizeof(_init));
+  }
+
+  // Process 8 SHA256 in parallel.
+  // Input: b0..b7 are arrays of uint32_t message words (big-endian padded).
+  void Transform(__m256i *s,
+                 uint32_t *b0, uint32_t *b1, uint32_t *b2, uint32_t *b3,
+                 uint32_t *b4, uint32_t *b5, uint32_t *b6, uint32_t *b7)
+  {
+    __m256i a,b,c,d,e,f,g,h;
+    __m256i w0,w1,w2,w3,w4,w5,w6,w7;
+    __m256i w8,w9,w10,w11,w12,w13,w14,w15;
+    __m256i T1,T2;
+
+    a = _mm256_load_si256(s + 0);
+    b = _mm256_load_si256(s + 1);
+    c = _mm256_load_si256(s + 2);
+    d = _mm256_load_si256(s + 3);
+    e = _mm256_load_si256(s + 4);
+    f = _mm256_load_si256(s + 5);
+    g = _mm256_load_si256(s + 6);
+    h = _mm256_load_si256(s + 7);
+
+    // Load 8 message words per slot; lane order: b0=lane7 .. b7=lane0
+    w0  = _mm256_set_epi32(b0[0],  b1[0],  b2[0],  b3[0],  b4[0],  b5[0],  b6[0],  b7[0]);
+    w1  = _mm256_set_epi32(b0[1],  b1[1],  b2[1],  b3[1],  b4[1],  b5[1],  b6[1],  b7[1]);
+    w2  = _mm256_set_epi32(b0[2],  b1[2],  b2[2],  b3[2],  b4[2],  b5[2],  b6[2],  b7[2]);
+    w3  = _mm256_set_epi32(b0[3],  b1[3],  b2[3],  b3[3],  b4[3],  b5[3],  b6[3],  b7[3]);
+    w4  = _mm256_set_epi32(b0[4],  b1[4],  b2[4],  b3[4],  b4[4],  b5[4],  b6[4],  b7[4]);
+    w5  = _mm256_set_epi32(b0[5],  b1[5],  b2[5],  b3[5],  b4[5],  b5[5],  b6[5],  b7[5]);
+    w6  = _mm256_set_epi32(b0[6],  b1[6],  b2[6],  b3[6],  b4[6],  b5[6],  b6[6],  b7[6]);
+    w7  = _mm256_set_epi32(b0[7],  b1[7],  b2[7],  b3[7],  b4[7],  b5[7],  b6[7],  b7[7]);
+    w8  = _mm256_set_epi32(b0[8],  b1[8],  b2[8],  b3[8],  b4[8],  b5[8],  b6[8],  b7[8]);
+    w9  = _mm256_set_epi32(b0[9],  b1[9],  b2[9],  b3[9],  b4[9],  b5[9],  b6[9],  b7[9]);
+    w10 = _mm256_set_epi32(b0[10], b1[10], b2[10], b3[10], b4[10], b5[10], b6[10], b7[10]);
+    w11 = _mm256_set_epi32(b0[11], b1[11], b2[11], b3[11], b4[11], b5[11], b6[11], b7[11]);
+    w12 = _mm256_set_epi32(b0[12], b1[12], b2[12], b3[12], b4[12], b5[12], b6[12], b7[12]);
+    w13 = _mm256_set_epi32(b0[13], b1[13], b2[13], b3[13], b4[13], b5[13], b6[13], b7[13]);
+    w14 = _mm256_set_epi32(b0[14], b1[14], b2[14], b3[14], b4[14], b5[14], b6[14], b7[14]);
+    w15 = _mm256_set_epi32(b0[15], b1[15], b2[15], b3[15], b4[15], b5[15], b6[15], b7[15]);
+
+    A_Round(a,b,c,d,e,f,g,h,0x428A2F98,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x71374491,w1);
+    A_Round(g,h,a,b,c,d,e,f,0xB5C0FBCF,w2);
+    A_Round(f,g,h,a,b,c,d,e,0xE9B5DBA5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x3956C25B,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x59F111F1,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x923F82A4,w6);
+    A_Round(b,c,d,e,f,g,h,a,0xAB1C5ED5,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xD807AA98,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x12835B01,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x243185BE,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x550C7DC3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x72BE5D74,w12);
+    A_Round(d,e,f,g,h,a,b,c,0x80DEB1FE,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x9BDC06A7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC19BF174,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0xE49B69C1,w0);
+    A_Round(h,a,b,c,d,e,f,g,0xEFBE4786,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x0FC19DC6,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x240CA1CC,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x2DE92C6F,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4A7484AA,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5CB0A9DC,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x76F988DA,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x983E5152,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA831C66D,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xB00327C8,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xBF597FC7,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xC6E00BF3,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD5A79147,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x06CA6351,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x14292967,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x27B70A85,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x2E1B2138,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x4D2C6DFC,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x53380D13,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x650A7354,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x766A0ABB,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x81C2C92E,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x92722C85,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xA2BFE8A1,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA81A664B,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xC24B8B70,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xC76C51A3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xD192E819,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD6990624,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xF40E3585,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x106AA070,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x19A4C116,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x1E376C08,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x2748774C,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x34B0BCB5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x391C0CB3,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4ED8AA4A,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5B9CCA4F,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x682E6FF3,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x748F82EE,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x78A5636F,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x84C87814,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x8CC70208,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x90BEFFFA,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xA4506CEB,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xBEF9A3F7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC67178F2,w15);
+
+    s[0] = _mm256_add_epi32(a, s[0]);
+    s[1] = _mm256_add_epi32(b, s[1]);
+    s[2] = _mm256_add_epi32(c, s[2]);
+    s[3] = _mm256_add_epi32(d, s[3]);
+    s[4] = _mm256_add_epi32(e, s[4]);
+    s[5] = _mm256_add_epi32(f, s[5]);
+    s[6] = _mm256_add_epi32(g, s[6]);
+    s[7] = _mm256_add_epi32(h, s[7]);
+  }
+
+  // Process 8 SHA(SHA(bi))[0] in parallel (double-SHA, returns first word only).
+  void Transform2(__m256i *s,
+                  uint32_t *b0, uint32_t *b1, uint32_t *b2, uint32_t *b3,
+                  uint32_t *b4, uint32_t *b5, uint32_t *b6, uint32_t *b7)
+  {
+    __m256i a,b,c,d,e,f,g,h;
+    __m256i w0,w1,w2,w3,w4,w5,w6,w7;
+    __m256i w8,w9,w10,w11,w12,w13,w14,w15;
+    __m256i T1,T2;
+
+    a = _mm256_load_si256(s + 0);
+    b = _mm256_load_si256(s + 1);
+    c = _mm256_load_si256(s + 2);
+    d = _mm256_load_si256(s + 3);
+    e = _mm256_load_si256(s + 4);
+    f = _mm256_load_si256(s + 5);
+    g = _mm256_load_si256(s + 6);
+    h = _mm256_load_si256(s + 7);
+
+    w0  = _mm256_set_epi32(b0[0],  b1[0],  b2[0],  b3[0],  b4[0],  b5[0],  b6[0],  b7[0]);
+    w1  = _mm256_set_epi32(b0[1],  b1[1],  b2[1],  b3[1],  b4[1],  b5[1],  b6[1],  b7[1]);
+    w2  = _mm256_set_epi32(b0[2],  b1[2],  b2[2],  b3[2],  b4[2],  b5[2],  b6[2],  b7[2]);
+    w3  = _mm256_set_epi32(b0[3],  b1[3],  b2[3],  b3[3],  b4[3],  b5[3],  b6[3],  b7[3]);
+    w4  = _mm256_set_epi32(b0[4],  b1[4],  b2[4],  b3[4],  b4[4],  b5[4],  b6[4],  b7[4]);
+    w5  = _mm256_set_epi32(b0[5],  b1[5],  b2[5],  b3[5],  b4[5],  b5[5],  b6[5],  b7[5]);
+    w6  = _mm256_set_epi32(b0[6],  b1[6],  b2[6],  b3[6],  b4[6],  b5[6],  b6[6],  b7[6]);
+    w7  = _mm256_set_epi32(b0[7],  b1[7],  b2[7],  b3[7],  b4[7],  b5[7],  b6[7],  b7[7]);
+    w8  = _mm256_set_epi32(b0[8],  b1[8],  b2[8],  b3[8],  b4[8],  b5[8],  b6[8],  b7[8]);
+    w9  = _mm256_set_epi32(b0[9],  b1[9],  b2[9],  b3[9],  b4[9],  b5[9],  b6[9],  b7[9]);
+    w10 = _mm256_set_epi32(b0[10], b1[10], b2[10], b3[10], b4[10], b5[10], b6[10], b7[10]);
+    w11 = _mm256_set_epi32(b0[11], b1[11], b2[11], b3[11], b4[11], b5[11], b6[11], b7[11]);
+    w12 = _mm256_set_epi32(b0[12], b1[12], b2[12], b3[12], b4[12], b5[12], b6[12], b7[12]);
+    w13 = _mm256_set_epi32(b0[13], b1[13], b2[13], b3[13], b4[13], b5[13], b6[13], b7[13]);
+    w14 = _mm256_set_epi32(b0[14], b1[14], b2[14], b3[14], b4[14], b5[14], b6[14], b7[14]);
+    w15 = _mm256_set_epi32(b0[15], b1[15], b2[15], b3[15], b4[15], b5[15], b6[15], b7[15]);
+
+    A_Round(a,b,c,d,e,f,g,h,0x428A2F98,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x71374491,w1);
+    A_Round(g,h,a,b,c,d,e,f,0xB5C0FBCF,w2);
+    A_Round(f,g,h,a,b,c,d,e,0xE9B5DBA5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x3956C25B,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x59F111F1,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x923F82A4,w6);
+    A_Round(b,c,d,e,f,g,h,a,0xAB1C5ED5,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xD807AA98,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x12835B01,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x243185BE,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x550C7DC3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x72BE5D74,w12);
+    A_Round(d,e,f,g,h,a,b,c,0x80DEB1FE,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x9BDC06A7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC19BF174,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0xE49B69C1,w0);
+    A_Round(h,a,b,c,d,e,f,g,0xEFBE4786,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x0FC19DC6,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x240CA1CC,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x2DE92C6F,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4A7484AA,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5CB0A9DC,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x76F988DA,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x983E5152,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA831C66D,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xB00327C8,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xBF597FC7,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xC6E00BF3,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD5A79147,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x06CA6351,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x14292967,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x27B70A85,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x2E1B2138,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x4D2C6DFC,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x53380D13,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x650A7354,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x766A0ABB,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x81C2C92E,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x92722C85,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xA2BFE8A1,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA81A664B,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xC24B8B70,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xC76C51A3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xD192E819,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD6990624,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xF40E3585,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x106AA070,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x19A4C116,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x1E376C08,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x2748774C,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x34B0BCB5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x391C0CB3,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4ED8AA4A,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5B9CCA4F,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x682E6FF3,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x748F82EE,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x78A5636F,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x84C87814,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x8CC70208,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x90BEFFFA,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xA4506CEB,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xBEF9A3F7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC67178F2,w15);
+
+    // Double-SHA: feed first-round output as second-round input (32-byte message)
+    w0  = _mm256_add_epi32(a, s[0]);
+    w1  = _mm256_add_epi32(b, s[1]);
+    w2  = _mm256_add_epi32(c, s[2]);
+    w3  = _mm256_add_epi32(d, s[3]);
+    w4  = _mm256_add_epi32(e, s[4]);
+    w5  = _mm256_add_epi32(f, s[5]);
+    w6  = _mm256_add_epi32(g, s[6]);
+    w7  = _mm256_add_epi32(h, s[7]);
+    w8  = _mm256_set1_epi32(0x80000000);
+    w9  = _mm256_setzero_si256();
+    w10 = _mm256_setzero_si256();
+    w11 = _mm256_setzero_si256();
+    w12 = _mm256_setzero_si256();
+    w13 = _mm256_setzero_si256();
+    w14 = _mm256_setzero_si256();
+    w15 = _mm256_set1_epi32(0x100);
+
+    a = _mm256_load_si256(s + 0);
+    b = _mm256_load_si256(s + 1);
+    c = _mm256_load_si256(s + 2);
+    d = _mm256_load_si256(s + 3);
+    e = _mm256_load_si256(s + 4);
+    f = _mm256_load_si256(s + 5);
+    g = _mm256_load_si256(s + 6);
+    h = _mm256_load_si256(s + 7);
+
+    A_Round(a,b,c,d,e,f,g,h,0x428A2F98,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x71374491,w1);
+    A_Round(g,h,a,b,c,d,e,f,0xB5C0FBCF,w2);
+    A_Round(f,g,h,a,b,c,d,e,0xE9B5DBA5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x3956C25B,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x59F111F1,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x923F82A4,w6);
+    A_Round(b,c,d,e,f,g,h,a,0xAB1C5ED5,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xD807AA98,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x12835B01,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x243185BE,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x550C7DC3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x72BE5D74,w12);
+    A_Round(d,e,f,g,h,a,b,c,0x80DEB1FE,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x9BDC06A7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC19BF174,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0xE49B69C1,w0);
+    A_Round(h,a,b,c,d,e,f,g,0xEFBE4786,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x0FC19DC6,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x240CA1CC,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x2DE92C6F,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4A7484AA,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5CB0A9DC,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x76F988DA,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x983E5152,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA831C66D,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xB00327C8,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xBF597FC7,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xC6E00BF3,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD5A79147,w13);
+    A_Round(c,d,e,f,g,h,a,b,0x06CA6351,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x14292967,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x27B70A85,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x2E1B2138,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x4D2C6DFC,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x53380D13,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x650A7354,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x766A0ABB,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x81C2C92E,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x92722C85,w7);
+    A_Round(a,b,c,d,e,f,g,h,0xA2BFE8A1,w8);
+    A_Round(h,a,b,c,d,e,f,g,0xA81A664B,w9);
+    A_Round(g,h,a,b,c,d,e,f,0xC24B8B70,w10);
+    A_Round(f,g,h,a,b,c,d,e,0xC76C51A3,w11);
+    A_Round(e,f,g,h,a,b,c,d,0xD192E819,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xD6990624,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xF40E3585,w14);
+    A_Round(b,c,d,e,f,g,h,a,0x106AA070,w15);
+    A_WMIX()
+    A_Round(a,b,c,d,e,f,g,h,0x19A4C116,w0);
+    A_Round(h,a,b,c,d,e,f,g,0x1E376C08,w1);
+    A_Round(g,h,a,b,c,d,e,f,0x2748774C,w2);
+    A_Round(f,g,h,a,b,c,d,e,0x34B0BCB5,w3);
+    A_Round(e,f,g,h,a,b,c,d,0x391C0CB3,w4);
+    A_Round(d,e,f,g,h,a,b,c,0x4ED8AA4A,w5);
+    A_Round(c,d,e,f,g,h,a,b,0x5B9CCA4F,w6);
+    A_Round(b,c,d,e,f,g,h,a,0x682E6FF3,w7);
+    A_Round(a,b,c,d,e,f,g,h,0x748F82EE,w8);
+    A_Round(h,a,b,c,d,e,f,g,0x78A5636F,w9);
+    A_Round(g,h,a,b,c,d,e,f,0x84C87814,w10);
+    A_Round(f,g,h,a,b,c,d,e,0x8CC70208,w11);
+    A_Round(e,f,g,h,a,b,c,d,0x90BEFFFA,w12);
+    A_Round(d,e,f,g,h,a,b,c,0xA4506CEB,w13);
+    A_Round(c,d,e,f,g,h,a,b,0xBEF9A3F7,w14);
+    A_Round(b,c,d,e,f,g,h,a,0xC67178F2,w15);
+
+    s[0] = _mm256_add_epi32(a, s[0]);
+  }
+
+} // namespace _sha256avx2
+
+// Helper: extract lane i (0=low, 7=high) from __m256i as uint32_t
+static inline uint32_t avx2_lane32(const __m256i v, int i) {
+  uint32_t tmp[8] __attribute__((aligned(32)));
+  _mm256_store_si256((__m256i*)tmp, v);
+  return tmp[i];
+}
+
+// Unpack 8-wide AVX2 state into 8 separate 32-byte output buffers.
+// Lane mapping: b0=lane7, b1=lane6, ..., b7=lane0 (matching _mm256_set_epi32 order).
+static void avx2_unpack_8x32(
+    __m256i *s,
+    uint8_t *d0, uint8_t *d1, uint8_t *d2, uint8_t *d3,
+    uint8_t *d4, uint8_t *d5, uint8_t *d6, uint8_t *d7)
+{
+    uint8_t *dd[8] = { d7, d6, d5, d4, d3, d2, d1, d0 };
+
+    for (int word = 0; word < 8; word++) {
+        uint32_t vals[8] __attribute__((aligned(32)));
+        _mm256_store_si256((__m256i*)vals, s[word]);
+        for (int lane = 0; lane < 8; lane++) {
+            // bswap because SHA256 state is big-endian
+            uint32_t v = __builtin_bswap32(vals[lane]);
+            ((uint32_t*)dd[lane])[word] = v;
+        }
+    }
+}
+
+// Public API: 8-wide SHA256 for 1-block (33-byte compressed pubkey) inputs
+void sha256avx2_1B(
+  uint32_t *i0, uint32_t *i1, uint32_t *i2, uint32_t *i3,
+  uint32_t *i4, uint32_t *i5, uint32_t *i6, uint32_t *i7,
+  uint8_t  *d0, uint8_t  *d1, uint8_t  *d2, uint8_t  *d3,
+  uint8_t  *d4, uint8_t  *d5, uint8_t  *d6, uint8_t  *d7)
+{
+  __m256i s[8] __attribute__((aligned(32)));
+  _sha256avx2::Initialize(s);
+  _sha256avx2::Transform(s, i0, i1, i2, i3, i4, i5, i6, i7);
+  avx2_unpack_8x32(s, d0, d1, d2, d3, d4, d5, d6, d7);
+}
+
+// Public API: 8-wide SHA256 for 2-block (65-byte uncompressed pubkey) inputs
+void sha256avx2_2B(
+  uint32_t *i0, uint32_t *i1, uint32_t *i2, uint32_t *i3,
+  uint32_t *i4, uint32_t *i5, uint32_t *i6, uint32_t *i7,
+  uint8_t  *d0, uint8_t  *d1, uint8_t  *d2, uint8_t  *d3,
+  uint8_t  *d4, uint8_t  *d5, uint8_t  *d6, uint8_t  *d7)
+{
+  __m256i s[8] __attribute__((aligned(32)));
+  _sha256avx2::Initialize(s);
+  _sha256avx2::Transform(s,  i0,      i1,      i2,      i3,      i4,      i5,      i6,      i7);
+  _sha256avx2::Transform(s,  i0+16,   i1+16,   i2+16,   i3+16,   i4+16,   i5+16,   i6+16,   i7+16);
+  avx2_unpack_8x32(s, d0, d1, d2, d3, d4, d5, d6, d7);
+}
+
+#undef A_Maj
+#undef A_Ch
+#undef A_ROR
+#undef A_SHR
+#undef A_S0
+#undef A_S1
+#undef A_s0
+#undef A_s1
+#undef A_add4
+#undef A_add3
+#undef A_add5
+#undef A_Round
+#undef A_WMIX
+
+#endif // __AVX2__
+
 #if 0
 void sha256sse_test() {
 

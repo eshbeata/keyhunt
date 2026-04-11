@@ -175,10 +175,12 @@ public:
     __declspec(align(16)) uint64_t bits64[NB64BLOCK];
   };
   */
+  // 64-byte cache-line alignment: eliminates unaligned loads and false sharing
+  // between adjacent Int values in arrays.
   union {
     uint32_t bits[NB32BLOCK];
     uint64_t bits64[NB64BLOCK];
-  };
+  } __attribute__((aligned(64)));
 
 private:
 

@@ -81,7 +81,7 @@ const char *ip_default = "127.0.0.1";
 char *IP;
 int port;
 
-#define CPU_GRP_SIZE 1024
+#define CPU_GRP_SIZE 2048
 
 std::vector<Point> Gn;
 Point _2Gn;
@@ -1598,8 +1598,8 @@ void *thread_process_bsgs(void *vargp)	{
 	
 
 	
-	cycles = bsgs_aux / 1024;
-	if(bsgs_aux % 1024 != 0)	{
+	cycles = bsgs_aux / CPU_GRP_SIZE;
+	if(bsgs_aux % CPU_GRP_SIZE != 0)	{
 		cycles++;
 	}
 
@@ -1770,7 +1770,7 @@ pn.y.ModAdd(&GSn[i].y);
 					r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 					
 					if(r) {
-						r = bsgs_secondcheck(&base_key,((j*1024) + i),&keyfound);
+						r = bsgs_secondcheck(&base_key,((j*CPU_GRP_SIZE) + i),&keyfound);
 						if(r)	{
 							hextemp = keyfound.GetBase16();
 							printf("[+] Thread Key found privkey %s   \n",hextemp);

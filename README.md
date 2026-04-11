@@ -1265,6 +1265,78 @@ address: 0xf1f6619b38a98d6de0800f1defc0a6399eb6d30c
 ....
 ```
 
+## Performance & Optimization
+
+This repository includes a comprehensive set of performance optimizations. See [PERFORMANCE.md](PERFORMANCE.md) for the full guide, including:
+
+- AVX2 8-wide SHA256 and RIPEMD160 (up to 1.9× hash throughput on modern x86 CPUs)
+- Bloom filter: XXH3_128 replacing double XXH64, two-phase prefetch, power-of-2 bit count
+- CPU batch size increased from 1024 to 2048 keys per group
+- LTO, `-mavx2`, and PGO build targets
+- Memory alignment for Int structures and heap arrays
+
+## Distributed / Multi-Node Operation
+
+Three new flags enable keyspace partitioning and checkpointing across multiple machines:
+
+### `-P <partition_file>` — Load node keyspace from a partition file
+
+Partition file format (one node per line: `<node_id> <start_hex> <end_hex>`):
+
+```
+0 0000000000000001 00000000FFFFFFFF
+1 0000000100000000 00000001FFFFFFFF
+2 0000000200000000 00000002FFFFFFFF
+```
+
+### `-X <node_id>` — Select which line to load from the partition file
+
+Always use `-P` and `-X` together:
+
+```
+./keyhunt -m address -f addresses.txt -P partitions.txt -X 0 -t 8
+./keyhunt -m address -f addresses.txt -P partitions.txt -X 1 -t 8
+```
+
+### `-K <checkpoint_file>` — Enable checkpoint save and auto-resume
+
+On startup, loads `POS=` from the checkpoint file (if it exists) and resumes from that position. During the run, writes the current position atomically every stats interval.
+
+```
+./keyhunt -m address -f addresses.txt -r 1:FFFFFFFFFFFF -K checkpoint.txt -s 30
+```
+
+Checkpoint file format:
+
+```
+POS=<current_position_hex>
+COUNT=<total_keys_checked>
+TIME=<unix_timestamp>
+```
+
+To resume after interruption, simply run the same command again — the `-K` flag handles detection and resume automatically.
+
+### Full distributed example
+
+```bash
+# Generate partitions for 4 nodes covering bit range 66
+# Node 0
+./keyhunt -m address -f puzzle66.txt -b 66 -P partitions.txt -X 0 -K node0.ckpt -t 8 -q -s 60
+
+# Node 1 (separate machine, same bloom filter)
+./keyhunt -m address -f puzzle66.txt -b 66 -P partitions.txt -X 1 -K node1.ckpt -t 8 -q -s 60
+```
+
+## Build Targets
+
+```bash
+make           # Standard build (auto-detects AVX2 on x86_64)
+make legacy    # Legacy build (libssl + libgmp)
+make pgo-generate  # Build with profiling instrumentation
+make pgo-use       # Rebuild using collected profile data (fastest binary)
+make avx512        # Enable AVX-512 (Ice Lake / Sapphire Rapids only)
+```
+
 ## Speeds
 
 I already explain the speed for BSGS
@@ -1273,14 +1345,13 @@ But since there is new updates for other modes I want to clarify it.
 
 For the modes `address`, `rmd160`, `xpoint` and `vanity`
 
-Each thread works in groups of 1024 keys, so every time that one inner-cycle 
-of each thread is finished the code update its own coutner in 1
+Each thread works in groups of **2048** keys (increased from 1024 for better ModInv amortization). Each inner-cycle increments the thread's step counter by 1:
 
 ```
-steps[thread_number]++;
+steps[thread_number * STEPS_STRIDE]++;
 ```
 
-So every step represent 1024 keys scanned.
+So every step represents 2048 keys scanned.
 
 if you enabled endomorphism, the total steps are multiplied by 6 for modes `address`, `rmd160` and `vanity`.
 Becuase with endomorphism we checking  efectively 6 different keys every step
@@ -1288,15 +1359,17 @@ Becuase with endomorphism we checking  efectively 6 different keys every step
 For `xpoint` mode plus endomorphism the number is only is multiplied by 3 only becasue we only care
 about the X value and we don't need the negated values ( mirror Y axis)
 
-Special case for `compress` search of the modes`address`, `rmd160` and `vanity` 
-WITHOUT `endomorphism` enabled, for this conditions the speed is multipied by 2 
-because we are checking efectively 2 keys the program calculate one X value and 
-it is checking both prefixes `02 + X value` and `03 + X value`, this is NOT optional
-Y try to do it without this behavior but in that case the speed is worse
+Special case for `compress` search of the modes `address`, `rmd160` and `vanity`
+WITHOUT `endomorphism` enabled: the speed is multiplied by 2 because we check both
+prefixes `02 + X value` and `03 + X value` from a single X computation.
 
-This is important because if you targeting an specific range with `compress` and WITHOUT endomorphism by examples puzzles
- the efective speed is half of the showed speed by the program
-But if you are targeting all the curve then the showed speed is correct.
+This is important: if you target a specific range with `compress` and WITHOUT endomorphism
+(e.g., Bitcoin puzzles), the **effective** speed is half the displayed speed.
+If targeting the full curve, the displayed speed is correct.
+
+**AVX2 note:** With AVX2-capable CPUs, the default `SEARCH_BOTH` mode (compress + uncompress)
+now also benefits from 8-wide hash batching — no need to specify `-l compress` to get
+AVX2 acceleration.
 
 ## FAQ
 

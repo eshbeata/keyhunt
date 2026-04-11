@@ -21,7 +21,10 @@ using namespace std;
 
 IntGroup::IntGroup(int size) {
   this->size = size;
-  subp = (Int *)malloc(size * sizeof(Int));
+  // Use 64-byte aligned allocation so each Int starts on a cache-line boundary
+  if (posix_memalign((void **)&subp, 64, (size_t)size * sizeof(Int)) != 0) {
+    subp = nullptr;
+  }
 }
 
 IntGroup::~IntGroup() {

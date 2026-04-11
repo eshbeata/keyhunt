@@ -40,8 +40,14 @@ struct bloom
   uint8_t ready;
   uint8_t major;
   uint8_t minor;
+  // If bits is a power of 2, bits_mask = bits-1 and we use & instead of %.
+  // Set to 0 when not applicable.
+  uint8_t use_mask;
   double bpe;
+  uint64_t bits_mask;   // = bits - 1 when use_mask != 0
   uint8_t *bf;
+  // mmap flag: if non-zero, bf was mapped via mmap and must be munmapped
+  uint8_t mmap_flag;
 };
 /*
 Customs
@@ -205,6 +211,34 @@ int bloom_reset(struct bloom * bloom);
  *
  */
 //int bloom_load(struct bloom * bloom, char * filename);
+
+
+/** ***************************************************************************
+ * Save bloom filter bit array + header to a binary file.
+ * The file can later be loaded with bloom_load_file() or bloom_load_mmap().
+ *
+ * Return: 0 on success, 1 on failure.
+ */
+int bloom_save_file(struct bloom *bloom, const char *filename);
+
+
+/** ***************************************************************************
+ * Load a bloom filter from a file saved with bloom_save_file().
+ * Allocates bf via malloc; use bloom_free() to release.
+ *
+ * Return: 0 on success, >0 on failure.
+ */
+int bloom_load_file(struct bloom *bloom, const char *filename);
+
+
+/** ***************************************************************************
+ * Load a bloom filter from a file via mmap (read-only, MAP_POPULATE).
+ * Faster startup on large filters; multiple processes share the same pages.
+ * Use bloom_free() to release (calls munmap automatically).
+ *
+ * Return: 0 on success, >0 on failure.
+ */
+int bloom_load_mmap(struct bloom *bloom, const char *filename);
 
 
 /** ***************************************************************************

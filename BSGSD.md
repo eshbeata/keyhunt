@@ -1,30 +1,31 @@
 # BSGSD
 
-`BSGS` method  but as local `server`, final `D` stand for daemon.
+`BSGS` method but as a local `server`; the final `D` stands for daemon.
 
 ### Compilation
-Same as keyhunt we need to do 
-```make bsgsd```
+
+```
+make bsgsd
+```
+
+The `bsgsd` target uses the same optimized flags as `keyhunt` (AVX2, `-flto`, `-O3 -ffast-math`). On x86-64 this automatically enables 8-wide SIMD hashing and the improved bloom filter (XXH3_128 + prefetch).
 
 ### Parameters
 
- - `-6` To skip file checksum
- - `-t number` Threads Number
- - `-k factor` Same K factor dor keyhunt
- - `-n number` Length of the Range to scan each cycle, same as keyhunt
- - `-i ip`     IP for listening default is `127.0.0.1`
- - `-p port`   Port for listening default is `8080`
+ - `-6`         Skip file checksum verification
+ - `-t number`  Number of threads
+ - `-k factor`  K factor (same meaning as keyhunt; controls baby-step table size)
+ - `-n number`  Range length to scan per cycle (decimal or `0x` hex); must have an exact integer square root
+ - `-i ip`      Listening IP address (default: `127.0.0.1`)
+ - `-p port`    Listening port (default: `8080`)
 
-bsgsd use the same keyhunt files `.blm` and `.tbl` 
+bsgsd uses the same keyhunt files `.blm` and `.tbl`.
 
 ### Server
-This program is an small and custom server without any protocol.
-By default the server only listen on `localhost` port `8080`
-```
-localhost:8080
-```
-Tha main advantage of this server is that BSGS blooms and table are always on RAM
-Clients need to send a single line and wait for reply
+
+This is a minimal TCP server with no standard protocol. By default it listens only on `localhost:8080`.
+
+The main advantage is that BSGS bloom filters and the bP table are loaded into RAM once at startup and reused across all client requests — no reload overhead per query. Clients send a single line and wait for a single-line reply.
 
 Format of the client request:
 ```
@@ -54,7 +55,7 @@ Run the server in one terminal:
 [+] K factor 4096
 [+] Threads : 8
 [W] Skipping checksums on files
-[+] Mode BSGS secuential
+[+] Mode BSGS sequential
 [+] N = 0x100000000000
 [+] Bloom filter for 17179869184 elements : 58890.60 MB
 [+] Bloom filter for 536870912 elements : 1840.33 MB
