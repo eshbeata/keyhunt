@@ -245,6 +245,7 @@ Int BSGS_CURRENT;
 Int BSGS_R;
 Int BSGS_AUX;
 Int BSGS_N;
+Int BSGS_N_double;			//N * 2 (precomputed to shrink mutex critical section)
 Int BSGS_M;					//M is squareroot(N)
 Int BSGS_M_double;
 Int BSGS_M2;				//M2 is M/32
@@ -514,6 +515,9 @@ int main(int argc, char **argv)	{
 		printf("[+] N = 0x%s\n",hextemp);
 		bsgs_m = BSGS_M.GetInt64();
 		free(hextemp);
+
+		BSGS_N_double.SetInt32(2);
+		BSGS_N_double.Mult(&BSGS_N);
 
 
 		
@@ -1583,9 +1587,9 @@ void *thread_process_bsgs(void *vargp)	{
 	Point startP;
 	
 	int hLength = (CPU_GRP_SIZE / 2 - 1);
-	
-	Int dx[CPU_GRP_SIZE / 2 + 1];
-	Point pts[CPU_GRP_SIZE];
+
+	Int dx[CPU_GRP_SIZE / 2 + 1] __attribute__((aligned(64)));
+	Point pts[CPU_GRP_SIZE]      __attribute__((aligned(64)));
 
 	Int dy;
 	Int dyn;
@@ -1626,9 +1630,8 @@ void *thread_process_bsgs(void *vargp)	{
 		pthread_mutex_lock(&mutex_bsgs_thread);
 
 		base_key.Set(&BSGS_CURRENT);	/* we need to set our base_key to the current BSGS_CURRENT value*/
-		BSGS_CURRENT.Add(&BSGS_N);		/*Then add BSGS_N to BSGS_CURRENT*/
-		BSGS_CURRENT.Add(&BSGS_N);		/*Then add BSGS_N to BSGS_CURRENT*/
-		
+		BSGS_CURRENT.Add(&BSGS_N_double);	/*Then add 2*BSGS_N to BSGS_CURRENT (precomputed to halve mutex hold time)*/
+
 		pthread_mutex_unlock(&mutex_bsgs_thread);
 
 		if(base_key.IsGreaterOrEqual(&n_range_end))
@@ -1968,11 +1971,11 @@ void *thread_bPload(void *vargp)	{
 	
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
-	Int dx[CPU_GRP_SIZE / 2 + 1];
-	Point pts[CPU_GRP_SIZE];
+	Int dx[CPU_GRP_SIZE / 2 + 1] __attribute__((aligned(64)));
+	Point pts[CPU_GRP_SIZE]      __attribute__((aligned(64)));
 	Int dy,dyn,_s,_p;
 	Point pp,pn;
-	
+
 	int i,bloom_bP_index,hLength = (CPU_GRP_SIZE / 2 - 1) ,threadid;
 	tt = (struct bPload *)vargp;
 	Int km((uint64_t)(tt->from + 1));
@@ -2125,8 +2128,8 @@ void *thread_bPload_2blooms(void *vargp)	{
 	uint64_t i_counter,j,nbStep;
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
-	Int dx[CPU_GRP_SIZE / 2 + 1];
-	Point pts[CPU_GRP_SIZE];
+	Int dx[CPU_GRP_SIZE / 2 + 1] __attribute__((aligned(64)));
+	Point pts[CPU_GRP_SIZE]      __attribute__((aligned(64)));
 	Int dy,dyn,_s,_p;
 	Point pp,pn;
 	int i,bloom_bP_index,hLength = (CPU_GRP_SIZE / 2 - 1) ,threadid;
@@ -2281,13 +2284,14 @@ bin_publickey to generate the binary address, which is stored in dst_address. */
 void menu() {
 	printf("\nUsage:\n");
 	printf("-h          show this help\n");
+	printf("-6          skip SHA256 checksum verification on bloom/bP files (faster startup)\n");
 	printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("-t tn       Threads number, must be a positive integer\n");
-	printf("-p port     TCP port Number for listening conections");
-	printf("-i ip		IP Address for listening conections");
+	printf("-p port     TCP port Number for listening conections\n");
+	printf("-i ip       IP Address for listening conections\n");
 	printf("\nExample:\n\n");
-	printf("./bsgs -k 512 \n\n");
+	printf("./bsgsd -k 512 -t 8 -6\n\n");
 	exit(EXIT_FAILURE);
 }
 

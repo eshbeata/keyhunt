@@ -136,3 +136,56 @@ bsgsd:
 	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -o hash/sha256_sse.o -c hash/sha256_sse.cpp
 	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -o bsgsd bsgsd.cpp base58.o rmd160.o hash/ripemd160.o hash/ripemd160_sse.o hash/sha256.o hash/sha256_sse.o bloom.o oldbloom.o xxhash.o util.o Int.o Point.o SECP256K1.o IntMod.o Random.o IntGroup.o sha3.o keccak.o $(LDFLAGS)
 	rm -f *.o
+
+# AVX-512 variant of bsgsd (x86-64 only: Ice Lake / Sapphire Rapids / Zen 4)
+bsgsd-avx512:
+	$(MAKE) ARCH_FLAGS="-m64 -mssse3 -mavx2 -mavx512f -mavx512bw -mavx512vl" bsgsd
+
+# PGO step 1 for bsgsd: build with instrumentation
+bsgsd-pgo-generate:
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c oldbloom/bloom.cpp -o oldbloom.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c bloom/bloom.cpp -o bloom.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -Wno-unused-parameter -fprofile-generate -c base58/base58.c -o base58.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -fprofile-generate -c rmd160/rmd160.c -o rmd160.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c sha3/sha3.c -o sha3.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c sha3/keccak.c -o keccak.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -fprofile-generate -c xxhash/xxhash.c -o xxhash.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c util.c -o util.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/Int.cpp -o Int.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/Point.cpp -o Point.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/SECP256K1.cpp -o SECP256K1.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/IntMod.cpp -o IntMod.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/Random.cpp -o Random.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -c secp256k1/IntGroup.cpp -o IntGroup.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -o hash/ripemd160.o -c hash/ripemd160.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -o hash/sha256.o -c hash/sha256.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -o hash/ripemd160_sse.o -c hash/ripemd160_sse.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -o hash/sha256_sse.o -c hash/sha256_sse.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-generate -o bsgsd bsgsd.cpp base58.o rmd160.o hash/ripemd160.o hash/ripemd160_sse.o hash/sha256.o hash/sha256_sse.o bloom.o oldbloom.o xxhash.o util.o Int.o Point.o SECP256K1.o IntMod.o Random.o IntGroup.o sha3.o keccak.o $(LDFLAGS)
+	rm -f *.o
+	@echo "Run a representative workload now, e.g.:"
+	@echo "  ./bsgsd -k 128 -t 4 -6    (serve a known-answer lookup against the server)"
+	@echo "Then run: make bsgsd-pgo-use"
+
+# PGO step 2 for bsgsd: rebuild using profile data
+bsgsd-pgo-use:
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c oldbloom/bloom.cpp -o oldbloom.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c bloom/bloom.cpp -o bloom.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -Wno-unused-parameter -fprofile-use -fprofile-correction -c base58/base58.c -o base58.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -fprofile-use -fprofile-correction -c rmd160/rmd160.c -o rmd160.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c sha3/sha3.c -o sha3.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c sha3/keccak.c -o keccak.o
+	gcc $(CFLAGS_COMMON) -Wall -Wextra -fprofile-use -fprofile-correction -c xxhash/xxhash.c -o xxhash.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c util.c -o util.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/Int.cpp -o Int.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/Point.cpp -o Point.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/SECP256K1.cpp -o SECP256K1.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/IntMod.cpp -o IntMod.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/Random.cpp -o Random.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -c secp256k1/IntGroup.cpp -o IntGroup.o
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -o hash/ripemd160.o -c hash/ripemd160.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -o hash/sha256.o -c hash/sha256.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -o hash/ripemd160_sse.o -c hash/ripemd160_sse.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -o hash/sha256_sse.o -c hash/sha256_sse.cpp
+	g++ $(CFLAGS_COMMON) $(CFLAGS_WARN) -fprofile-use -fprofile-correction -o bsgsd bsgsd.cpp base58.o rmd160.o hash/ripemd160.o hash/ripemd160_sse.o hash/sha256.o hash/sha256_sse.o bloom.o oldbloom.o xxhash.o util.o Int.o Point.o SECP256K1.o IntMod.o Random.o IntGroup.o sha3.o keccak.o $(LDFLAGS)
+	rm -f *.o
