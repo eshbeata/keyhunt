@@ -9,7 +9,13 @@ else
   ARCH_FLAGS  =
 endif
 SIMD_FLAGS    = $(ARCH_FLAGS)
-CFLAGS_COMMON = -march=native -mtune=native $(SIMD_FLAGS) -O3 -ffast-math -ftree-vectorize -flto -funroll-loops -fomit-frame-pointer
+# Note: -march=native / -mtune=native omitted intentionally. Some virtualized
+# environments (Docker / LXC / KVM) advertise host CPU features in /proc/cpuinfo
+# that the guest cannot actually execute, causing silent hangs at startup.
+# Explicit -mssse3 / -mavx2 from $(SIMD_FLAGS) covers the SIMD paths we rely on.
+# For bare-metal builds where you want per-CPU tuning, prepend -march=native via:
+#   make CFLAGS_COMMON="-march=native -mtune=native $(shell make -p | grep CFLAGS_COMMON)"
+CFLAGS_COMMON = $(SIMD_FLAGS) -O3 -ffast-math -ftree-vectorize -flto -funroll-loops -fomit-frame-pointer
 CFLAGS_WARN   = -Wall -Wextra -Wno-deprecated-copy
 LDFLAGS       = -flto -lm -lpthread
 
